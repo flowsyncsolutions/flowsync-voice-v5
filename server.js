@@ -8,6 +8,10 @@ const FLOWSYNC_API_KEY = process.env.FLOWSYNC_API_KEY;
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const GREETING =
   "Hi, thanks for calling. Someone from the FlowSync team will be with you shortly.";
+const SILENCE_REPROMPT_MS = 9000;
+const SILENCE_REPROMPT_TEXT = "How can I help you today?";
+
+const silenceTimers = new Map();
 
 app.use(express.json({ type: "*/*" }));
 
@@ -70,6 +74,46 @@ async function sendTelnyxAction(callControlId, action, body) {
       })
     );
   }
+}
+
+function scheduleSilenceTimer(callControlId) {
+  if (silenceTimers.has(callControlId)) {
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    console.log(`[v5 Silence] fired call_control_id=${callControlId}`);
+    silenceTimers.delete(callControlId);
+    sendTelnyxAction(callControlId, "speak", {
+      payload: SILENCE_REPROMPT_TEXT,
+      voice: "female",
+      language: "en-US",
+    }).catch((error) => {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "Silence reprompt failed",
+          call_control_id: callControlId,
+          error: error?.message || String(error),
+        })
+      );
+    });
+  }, SILENCE_REPROMPT_MS);
+
+  silenceTimers.set(callControlId, timer);
+  console.log(
+    `[v5 Silence] scheduled call_control_id=${callControlId} timeout_ms=${SILENCE_REPROMPT_MS}`
+  );
+}
+
+function cancelSilenceTimer(callControlId, reason) {
+  const timer = silenceTimers.get(callControlId);
+  if (!timer) return;
+  clearTimeout(timer);
+  silenceTimers.delete(callControlId);
+  console.log(
+    `[v5 Silence] canceled call_control_id=${callControlId} reason=${reason}`
+  );
 }
 
 async function fetchGreeting(toNumber) {
@@ -165,9 +209,10 @@ async function handleTelnyxEvent(eventType, payload) {
         voice: "female",
         language: "en-US",
       });
+      scheduleSilenceTimer(callControlId);
       break;
     case "call.hangup":
-      // Nothing to do beyond logging.
+      cancelSilenceTimer(callControlId, "hangup");
       break;
     default:
       // Unknown or unhandled event; logged already.

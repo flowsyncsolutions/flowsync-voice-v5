@@ -13,11 +13,13 @@ const GREETING =
   "Hi, thanks for calling. Someone from the FlowSync team will be with you shortly.";
 const SILENCE_REPROMPT_MS = 9000;
 const SILENCE_REPROMPT_TEXT = "How can I help you today?";
+const CALLBACK_OFFER = "Would you like someone to call you back?";
 const DEEPGRAM_WS_URL =
   "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000";
 
 const silenceTimers = new Map();
 const sttSessions = new Map();
+const contextCache = new Map();
 
 app.use(express.json({ type: "*/*" }));
 
@@ -135,9 +137,10 @@ function cleanupStt(callControlId) {
   }
 
   sttSessions.delete(callControlId);
+  contextCache.delete(callControlId);
 }
 
-async function fetchGreeting(toNumber) {
+async function fetchGreeting(toNumber, callControlId) {
   if (!toNumber || !FLOWSYNC_BASE_URL || !FLOWSYNC_API_KEY) {
     console.log(
       `[v5 Config] to=${toNumber || "unknown"} http_status=skipped greeting_source=fallback`
@@ -162,6 +165,9 @@ async function fetchGreeting(toNumber) {
     if (response.ok) {
       const data = await response.json().catch(() => ({}));
       const context = data?.context || data;
+      if (callControlId) {
+        contextCache.set(callControlId, context);
+      }
       greetingText = context?.greeting || context?.greeting_line || null;
     }
 
@@ -231,6 +237,111 @@ async function startTelnyxStreaming(callControlId, reqHost) {
   });
 }
 
+function normalizeText(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function countSentences(text) {
+  return (text || "")
+    .split(/[.!?]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean).length;
+}
+
+function isShortAnswer(answer) {
+  const text = answer || "";
+  return text.length <= 280 && countSentences(text) <= 2;
+}
+
+function findFaqMatch(transcript, faqs) {
+  if (!transcript || !Array.isArray(faqs) || faqs.length === 0) return null;
+  const normTranscript = normalizeText(transcript);
+  if (!normTranscript) return null;
+
+  const transcriptTokens = new Set(normTranscript.split(" ").filter(Boolean));
+  let best = null;
+
+  faqs.forEach((faq, index) => {
+    const questionNorm = normalizeText(faq?.question || "");
+    const keywords = Array.isArray(faq?.keywords) ? faq.keywords : [];
+    let score = 0;
+
+    if (questionNorm && normTranscript.includes(questionNorm)) {
+      score += 5;
+    } else {
+      const qTokens = questionNorm.split(" ").filter(Boolean);
+      qTokens.forEach((tok) => {
+        if (transcriptTokens.has(tok)) score += 1;
+      });
+    }
+
+    keywords.forEach((kw) => {
+      const kwNorm = normalizeText(kw);
+      if (kwNorm && normTranscript.includes(kwNorm)) {
+        score += 2;
+      }
+    });
+
+    if (score > 0 && (!best || score > best.score)) {
+      best = { faq, score, index };
+    }
+  });
+
+  if (!best || best.score < 3) return null;
+  return best;
+}
+
+async function handleFaqResponse(callControlId, transcript) {
+  const session = sttSessions.get(callControlId);
+  const context = session?.context || contextCache.get(callControlId) || {};
+  const faqs = Array.isArray(context?.faqs) ? context.faqs : [];
+  const contextCached = Boolean(session?.context || contextCache.get(callControlId));
+
+  console.log(
+    `[v5 FAQ] call_control_id=${callControlId} context_cached=${contextCached} faqs=${faqs.length}`
+  );
+
+  const match = findFaqMatch(transcript, faqs);
+
+  if (!match || !match.faq?.answer) {
+    console.log(
+      `[v5 FAQ] call_control_id=${callControlId} match=none answer_len=0 action=callback`
+    );
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: CALLBACK_OFFER,
+      voice: "female",
+      language: "en-US",
+    });
+    return;
+  }
+
+  const answer = match.faq.answer || "";
+  const short = isShortAnswer(answer);
+  const action = short ? "speak_answer" : "callback";
+
+  console.log(
+    `[v5 FAQ] call_control_id=${callControlId} match=${match.index} answer_len=${answer.length} action=${action}`
+  );
+
+  if (short) {
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: answer,
+      voice: "female",
+      language: "en-US",
+    });
+  } else {
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: CALLBACK_OFFER,
+      voice: "female",
+      language: "en-US",
+    });
+  }
+}
+
 async function handleTelnyxEvent(eventType, payload) {
   const callControlId = payload?.call_control_id;
   const toNumber = resolveToNumber(payload);
@@ -251,7 +362,7 @@ async function handleTelnyxEvent(eventType, payload) {
       await sendTelnyxAction(callControlId, "answer");
       break;
     case "call.answered":
-      const { greeting } = await fetchGreeting(toNumber);
+      const { greeting } = await fetchGreeting(toNumber, callControlId);
       await sendTelnyxAction(callControlId, "speak", {
         payload: greeting,
         voice: "female",
@@ -335,6 +446,7 @@ wss.on("connection", (ws, req) => {
     telnyxWs: ws,
     deepgramWs: null,
     finalized: false,
+    context: contextCache.get(callControlId) || null,
   };
   sttSessions.set(callControlId, session);
 
@@ -367,6 +479,17 @@ wss.on("connection", (ws, req) => {
     console.log(
       `[v5 STT] call_control_id=${callControlId} conf=${conf} text="${alt.transcript}"`
     );
+
+    handleFaqResponse(callControlId, alt.transcript).catch((error) => {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "FAQ handling failed",
+          call_control_id: callControlId,
+          error: error?.message || String(error),
+        })
+      );
+    });
 
     try {
       dgWs.close();

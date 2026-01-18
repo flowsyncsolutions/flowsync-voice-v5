@@ -359,6 +359,7 @@ wss.on("connection", (ws, req) => {
     if (!isFinal || !alt?.transcript) return;
 
     session.finalized = true;
+    cancelSilenceTimer(callControlId, "stt_final");
     const conf =
       typeof alt.confidence === "number"
         ? alt.confidence.toFixed(2)

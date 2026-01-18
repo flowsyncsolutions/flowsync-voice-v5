@@ -3,6 +3,8 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 8080;
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const FLOWSYNC_BASE_URL = process.env.FLOWSYNC_BASE_URL;
+const FLOWSYNC_API_KEY = process.env.FLOWSYNC_API_KEY;
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const GREETING =
   "Hi, thanks for calling. Someone from the FlowSync team will be with you shortly.";
@@ -70,8 +72,76 @@ async function sendTelnyxAction(callControlId, action, body) {
   }
 }
 
+async function fetchGreeting(toNumber) {
+  if (!toNumber || !FLOWSYNC_BASE_URL || !FLOWSYNC_API_KEY) {
+    console.log(
+      `[v5 Config] to=${toNumber || "unknown"} http_status=skipped greeting_source=fallback`
+    );
+    return { greeting: GREETING, source: "fallback" };
+  }
+
+  const url = `${FLOWSYNC_BASE_URL}/api/voice/context?phoneNumber=${encodeURIComponent(
+    toNumber
+  )}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "x-api-key": FLOWSYNC_API_KEY,
+      },
+    });
+
+    const status = response.status;
+    let greetingText = null;
+
+    if (response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const context = data?.context || data;
+      greetingText = context?.greeting || context?.greeting_line || null;
+    }
+
+    const source = greetingText ? "dashboard" : "fallback";
+    console.log(
+      `[v5 Config] to=${toNumber} http_status=${status} greeting_source=${source}`
+    );
+
+    return { greeting: greetingText || GREETING, source };
+  } catch (error) {
+    console.log(
+      `[v5 Config] to=${toNumber} http_status=error greeting_source=fallback`
+    );
+    return { greeting: GREETING, source: "fallback" };
+  }
+}
+
+function resolveToNumber(payload) {
+  if (!payload) return null;
+  if (typeof payload.to_number === "string" && payload.to_number.trim()) {
+    return payload.to_number;
+  }
+  if (
+    typeof payload.to_phone_number === "string" &&
+    payload.to_phone_number.trim()
+  ) {
+    return payload.to_phone_number;
+  }
+  if (payload.to && typeof payload.to === "object") {
+    if (typeof payload.to.phone_number === "string" && payload.to.phone_number.trim()) {
+      return payload.to.phone_number;
+    }
+    if (typeof payload.to.number === "string" && payload.to.number.trim()) {
+      return payload.to.number;
+    }
+  }
+  if (typeof payload.to === "string" && payload.to.trim()) {
+    return payload.to;
+  }
+  return null;
+}
+
 async function handleTelnyxEvent(eventType, payload) {
   const callControlId = payload?.call_control_id;
+  const toNumber = resolveToNumber(payload);
 
   if (!callControlId) {
     console.warn(
@@ -89,8 +159,9 @@ async function handleTelnyxEvent(eventType, payload) {
       await sendTelnyxAction(callControlId, "answer");
       break;
     case "call.answered":
+      const { greeting } = await fetchGreeting(toNumber);
       await sendTelnyxAction(callControlId, "speak", {
-        payload: GREETING,
+        payload: greeting,
         voice: "female",
         language: "en-US",
       });

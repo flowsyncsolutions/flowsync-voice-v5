@@ -253,8 +253,8 @@ function countSentences(text) {
 }
 
 function isShortAnswer(answer) {
-  const text = answer || "";
-  return text.length <= 280 && countSentences(text) <= 2;
+  const text = (answer || "").trim();
+  return text.length > 0 && text.length <= 280;
 }
 
 function findFaqMatch(transcript, faqs) {

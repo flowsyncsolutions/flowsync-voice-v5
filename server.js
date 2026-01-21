@@ -335,7 +335,7 @@ function isShortAnswer(answer) {
 function parseYesNo(text) {
   const norm = normalizeText(text);
   if (!norm) return null;
-  if (/\b(yes|yeah|yep|sure|affirmative)\b/.test(norm)) return true;
+  if (/\b(yes|yeah|yep|sure|ok|okay|affirmative)\b/.test(norm)) return true;
   if (/\b(no|nope|nah|negative)\b/.test(norm)) return false;
   return null;
 }
@@ -453,6 +453,82 @@ async function handleFlowTranscript(callControlId, transcript) {
     }
 
     state.step = "permission_to_enter";
+    return;
+  }
+
+  if (state.step === "permission_to_enter") {
+    const parsed = parseYesNo(transcript);
+    if (parsed === null) {
+      const tries = state.retries_permission || 0;
+      if (tries < 1) {
+        state.retries_permission = tries + 1;
+        await sendTelnyxAction(callControlId, "speak", {
+          payload:
+            "Do we have permission to enter your unit if you're not home? Please say yes or no.",
+          voice: "female",
+          language: "en-US",
+        });
+        return;
+      }
+    }
+    state.data.permission_to_enter = parsed;
+    console.log(
+      `[apt flow] captured permission_to_enter=${parsed} call_control_id=${callControlId}`
+    );
+    state.step = "pets_present";
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: "Are there any pets in the unit? Please say yes or no.",
+      voice: "female",
+      language: "en-US",
+    });
+    return;
+  }
+
+  if (state.step === "pets_present") {
+    const parsed = parseYesNo(transcript);
+    if (parsed === null) {
+      const tries = state.retries_pets || 0;
+      if (tries < 1) {
+        state.retries_pets = tries + 1;
+        await sendTelnyxAction(callControlId, "speak", {
+          payload: "Are there any pets in the unit? Please say yes or no.",
+          voice: "female",
+          language: "en-US",
+        });
+        return;
+      }
+    }
+    state.data.pets_present = parsed;
+    console.log(
+      `[apt flow] captured pets_present=${parsed} call_control_id=${callControlId}`
+    );
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: "Got it. I'll submit this maintenance ticket now.",
+      voice: "female",
+      language: "en-US",
+    });
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: "Thank you for calling. Goodbye.",
+      voice: "female",
+      language: "en-US",
+    });
+    const fieldsLog = {
+      unit_number: state.data.unit_number,
+      issue_description: state.data.issue_description,
+      is_emergency: state.data.is_emergency,
+      permission_to_enter: state.data.permission_to_enter,
+      pets_present: state.data.pets_present,
+    };
+    console.log(
+      `[apt flow] completed fields=${JSON.stringify(
+        fieldsLog
+      )} call_control_id=${callControlId}`
+    );
+    state.step = "complete";
+    const session = sttSessions.get(callControlId);
+    if (session) {
+      session.flowComplete = true;
+    }
     return;
   }
 }

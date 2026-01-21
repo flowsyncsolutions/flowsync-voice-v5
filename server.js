@@ -386,6 +386,7 @@ function findFaqMatch(transcript, faqs) {
 }
 
 async function initializeFlow(callControlId) {
+  cancelSilenceTimer(callControlId, "apt_flow_start");
   flowState.set(callControlId, { step: "unit_number", data: {} });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
   await sendTelnyxAction(callControlId, "speak", {
@@ -453,6 +454,12 @@ async function handleFlowTranscript(callControlId, transcript) {
     }
 
     state.step = "permission_to_enter";
+    await sendTelnyxAction(callControlId, "speak", {
+      payload:
+        "Do we have permission to enter your unit if you're not home? Please say yes or no.",
+      voice: "female",
+      language: "en-US",
+    });
     return;
   }
 

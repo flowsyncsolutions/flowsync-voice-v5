@@ -416,7 +416,43 @@ async function handleFlowTranscript(callControlId, transcript) {
   }
 
   if (state.step === "issue_description") {
-    // Step 13A stops here; ignore further flow actions for now.
+    const issue = (transcript || "").trim();
+    state.data.issue_description = issue;
+    console.log(
+      `[apt flow] captured issue_description="${issue}" call_control_id=${callControlId}`
+    );
+
+    const keywords = [
+      "fire",
+      "smoke",
+      "gas",
+      "flood",
+      "leak",
+      "water leak",
+      "no heat",
+      "sparks",
+    ];
+    const normIssue = normalizeText(issue);
+    const hits = keywords.filter((kw) => normIssue.includes(normalizeText(kw)));
+    const isEmergency = hits.length > 0;
+    state.data.is_emergency = isEmergency;
+    console.log(
+      `[apt flow] emergency=${isEmergency} keywords_hit=[${hits.join(",")}] call_control_id=${callControlId}`
+    );
+
+    if (isEmergency) {
+      console.log(
+        `[apt flow] emergency_ack spoken=true call_control_id=${callControlId}`
+      );
+      await sendTelnyxAction(callControlId, "speak", {
+        payload:
+          "I understand this sounds urgent. If you’re in danger, please call 911 now. I’ll log this as an emergency for maintenance.",
+        voice: "female",
+        language: "en-US",
+      });
+    }
+
+    state.step = "permission_to_enter";
     return;
   }
 }

@@ -285,6 +285,25 @@ function resolveToNumber(payload) {
   return null;
 }
 
+function resolveFromNumber(payload) {
+  if (!payload) return null;
+  if (typeof payload.from === "string" && payload.from.trim()) {
+    return payload.from;
+  }
+  if (typeof payload.from_number === "string" && payload.from_number.trim()) {
+    return payload.from_number;
+  }
+  if (payload.from && typeof payload.from === "object") {
+    if (typeof payload.from.phone_number === "string" && payload.from.phone_number.trim()) {
+      return payload.from.phone_number;
+    }
+    if (typeof payload.from.number === "string" && payload.from.number.trim()) {
+      return payload.from.number;
+    }
+  }
+  return null;
+}
+
 async function startTelnyxStreaming(callControlId, reqHost) {
   if (!DEEPGRAM_API_KEY) {
     console.log(
@@ -385,9 +404,13 @@ function findFaqMatch(transcript, faqs) {
   return best;
 }
 
-async function initializeFlow(callControlId) {
+async function initializeFlow(callControlId, toNumber, fromNumber) {
   cancelSilenceTimer(callControlId, "apt_flow_start");
-  flowState.set(callControlId, { step: "unit_number", data: {} });
+  flowState.set(callControlId, {
+    step: "unit_number",
+    data: { to_number: toNumber || "", from_number: fromNumber || "" },
+    ingested: false,
+  });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
   await sendTelnyxAction(callControlId, "speak", {
     payload: "To get this started, what is your unit number?",
@@ -519,6 +542,20 @@ async function handleFlowTranscript(callControlId, transcript) {
       voice: "female",
       language: "en-US",
     });
+    const summaryLines = [
+      `Unit: ${state.data.unit_number || ""}`,
+      `Issue: ${state.data.issue_description || ""}`,
+      `Emergency: ${state.data.is_emergency === undefined ? "" : state.data.is_emergency}`,
+      `Permission to enter: ${
+        state.data.permission_to_enter === undefined ? "" : state.data.permission_to_enter
+      }`,
+      `Pets present: ${
+        state.data.pets_present === undefined ? "" : state.data.pets_present
+      }`,
+      `Caller: ${state.data.from_number || ""}`,
+    ];
+    const ticketSummary = summaryLines.join("\n");
+
     const fieldsLog = {
       unit_number: state.data.unit_number,
       issue_description: state.data.issue_description,
@@ -531,6 +568,25 @@ async function handleFlowTranscript(callControlId, transcript) {
         fieldsLog
       )} call_control_id=${callControlId}`
     );
+    if (!state.ingested) {
+      state.ingested = true;
+      const payload = {
+        call_control_id: callControlId,
+        to_number: state.data.to_number || "",
+        from_number: state.data.from_number || "",
+        unit_number: state.data.unit_number || "",
+        issue_description: state.data.issue_description || "",
+        is_emergency: Boolean(state.data.is_emergency),
+        permission_to_enter:
+          state.data.permission_to_enter === undefined ? null : state.data.permission_to_enter,
+        pets_present:
+          state.data.pets_present === undefined ? null : state.data.pets_present,
+        transcript: ticketSummary,
+        created_at: new Date().toISOString(),
+      };
+      postMaintenanceEvent(callControlId, payload);
+    }
+
     state.step = "complete";
     const session = sttSessions.get(callControlId);
     if (session) {
@@ -587,9 +643,10 @@ async function handleFaqResponse(callControlId, transcript) {
   }
 }
 
-async function handleTelnyxEvent(eventType, payload) {
+async function handleTelnyxEvent(eventType, payload, reqHost) {
   const callControlId = payload?.call_control_id;
   const toNumber = resolveToNumber(payload);
+  const fromNumber = resolveFromNumber(payload);
 
   if (!callControlId) {
     console.warn(
@@ -614,7 +671,7 @@ async function handleTelnyxEvent(eventType, payload) {
         language: "en-US",
       });
       scheduleSilenceTimer(callControlId);
-      startTelnyxStreaming(callControlId, payload?.req_host).catch((error) => {
+      startTelnyxStreaming(callControlId, reqHost).catch((error) => {
         console.error(
           JSON.stringify({
             level: "error",
@@ -624,7 +681,7 @@ async function handleTelnyxEvent(eventType, payload) {
           })
         );
       });
-      initializeFlow(callControlId).catch((error) => {
+      initializeFlow(callControlId, toNumber, fromNumber).catch((error) => {
         console.error(
           JSON.stringify({
             level: "error",
@@ -652,12 +709,12 @@ app.get("/health", (_req, res) => {
 app.post("/telnyx/call", (req, res) => {
   const eventType = req.body?.data?.event_type || "unknown";
   const payload = req.body?.data?.payload || {};
-  payload.req_host = req.headers["host"];
+  const reqHost = req.headers["host"];
 
   logEvent(eventType, payload);
   res.status(200).json({ status: "ok" });
 
-  handleTelnyxEvent(eventType, payload).catch((error) => {
+  handleTelnyxEvent(eventType, payload, reqHost).catch((error) => {
     console.error(
       JSON.stringify({
         level: "error",
@@ -813,3 +870,38 @@ wss.on("connection", (ws, req) => {
     cleanupStt(callControlId);
   });
 });
+async function postMaintenanceEvent(callControlId, payload) {
+  if (!FLOWSYNC_BASE_URL || !FLOWSYNC_API_KEY) {
+    console.log(
+      `[v5 Ingest] call_control_id=${callControlId} http_status=skipped bytes=0`
+    );
+    return;
+  }
+
+  const url = `${FLOWSYNC_BASE_URL}/api/ingest/maintenance-event`;
+  const body = JSON.stringify(payload);
+  const size = Buffer.byteLength(body, "utf8");
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": FLOWSYNC_API_KEY,
+      },
+      body,
+    });
+
+    const status = response.status;
+    await response.text().catch(() => "");
+    console.log(
+      `[v5 Ingest] call_control_id=${callControlId} http_status=${status} bytes=${size}`
+    );
+  } catch (error) {
+    console.log(
+      `[v5 Ingest] call_control_id=${callControlId} http_status=error bytes=${size} msg=${
+        error?.message || String(error)
+      }`
+    );
+  }
+}

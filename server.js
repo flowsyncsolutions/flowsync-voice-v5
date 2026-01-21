@@ -14,12 +14,86 @@ const GREETING =
 const SILENCE_REPROMPT_MS = 9000;
 const SILENCE_REPROMPT_TEXT = "How can I help you today?";
 const CALLBACK_OFFER = "Would you like someone to call you back?";
+const FLOW_CONFIG = {
+  flow: "apartment_maintenance_intake_v1",
+  steps: [
+    {
+      step_id: "greeting",
+      prompt:
+        "Thanks for calling apartment maintenance. I’m here to help with your maintenance request.",
+      expected_input_type: "none",
+      field_name: null,
+    },
+    {
+      step_id: "unit_number",
+      prompt: "To get this started, what is your unit number?",
+      expected_input_type: "text",
+      field_name: "unit_number",
+    },
+    {
+      step_id: "issue_description",
+      prompt: "Please briefly describe the maintenance issue you’re experiencing.",
+      expected_input_type: "text",
+      field_name: "issue_description",
+    },
+    {
+      step_id: "emergency_detection",
+      type: "compute",
+      source_field: "issue_description",
+      field_name: "is_emergency",
+      emergency_keywords: [
+        "fire",
+        "smoke",
+        "gas",
+        "flood",
+        "water leak",
+        "no heat",
+        "sparks",
+      ],
+    },
+    {
+      step_id: "emergency_ack",
+      prompt:
+        "I understand this sounds urgent. If you’re in danger, please call 911 now. I’ll log this as an emergency for maintenance.",
+      expected_input_type: "none",
+      field_name: null,
+      only_if_emergency: true,
+    },
+    {
+      step_id: "permission_to_enter",
+      prompt: "Do we have permission to enter your unit if you’re not home? Please say yes or no.",
+      expected_input_type: "yes_no",
+      field_name: "permission_to_enter",
+      max_retries: 1,
+    },
+    {
+      step_id: "pets_present",
+      prompt: "Are there any pets in the unit? Please say yes or no.",
+      expected_input_type: "yes_no",
+      field_name: "pets_present",
+      max_retries: 1,
+    },
+    {
+      step_id: "confirmation",
+      prompt: "Got it. I’ll submit this maintenance ticket now.",
+      expected_input_type: "none",
+      field_name: null,
+    },
+    {
+      step_id: "end_call",
+      prompt: "Thank you for calling. Goodbye.",
+      expected_input_type: "none",
+      field_name: null,
+    },
+  ],
+};
 const DEEPGRAM_WS_URL =
   "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000";
 
 const silenceTimers = new Map();
 const sttSessions = new Map();
 const contextCache = new Map();
+const flowState = new Map();
 
 app.use(express.json({ type: "*/*" }));
 
@@ -138,6 +212,7 @@ function cleanupStt(callControlId) {
 
   sttSessions.delete(callControlId);
   contextCache.delete(callControlId);
+  flowState.delete(callControlId);
 }
 
 async function fetchGreeting(toNumber, callControlId) {
@@ -257,6 +332,21 @@ function isShortAnswer(answer) {
   return text.length > 0 && text.length <= 280;
 }
 
+function parseYesNo(text) {
+  const norm = normalizeText(text);
+  if (!norm) return null;
+  if (/\b(yes|yeah|yep|sure|affirmative)\b/.test(norm)) return true;
+  if (/\b(no|nope|nah|negative)\b/.test(norm)) return false;
+  return null;
+}
+
+function computeEmergency(issueText, keywords) {
+  const norm = normalizeText(issueText || "");
+  if (!norm) return false;
+  const lowerKeywords = (keywords || []).map((k) => normalizeText(k)).filter(Boolean);
+  return lowerKeywords.some((kw) => kw && norm.includes(kw));
+}
+
 function findFaqMatch(transcript, faqs) {
   if (!transcript || !Array.isArray(faqs) || faqs.length === 0) return null;
   const normTranscript = normalizeText(transcript);
@@ -293,6 +383,42 @@ function findFaqMatch(transcript, faqs) {
 
   if (!best || best.score < 3) return null;
   return best;
+}
+
+async function initializeFlow(callControlId) {
+  flowState.set(callControlId, { step: "unit_number", data: {} });
+  console.log(`[apt flow] started call_control_id=${callControlId}`);
+  await sendTelnyxAction(callControlId, "speak", {
+    payload: "To get this started, what is your unit number?",
+    voice: "female",
+    language: "en-US",
+  });
+}
+
+async function handleFlowTranscript(callControlId, transcript) {
+  const state = flowState.get(callControlId);
+  if (!state) return;
+
+  if (state.step === "unit_number") {
+    const unit = (transcript || "").trim();
+    state.data.unit_number = unit;
+    state.step = "issue_description";
+    console.log(
+      `[apt flow] captured unit_number="${unit}" call_control_id=${callControlId}`
+    );
+    console.log(`[apt flow] prompting issue_description call_control_id=${callControlId}`);
+    await sendTelnyxAction(callControlId, "speak", {
+      payload: "Please briefly describe the maintenance issue you’re experiencing.",
+      voice: "female",
+      language: "en-US",
+    });
+    return;
+  }
+
+  if (state.step === "issue_description") {
+    // Step 13A stops here; ignore further flow actions for now.
+    return;
+  }
 }
 
 async function handleFaqResponse(callControlId, transcript) {
@@ -379,6 +505,16 @@ async function handleTelnyxEvent(eventType, payload) {
           })
         );
       });
+      initializeFlow(callControlId).catch((error) => {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "flow start failed",
+            call_control_id: callControlId,
+            error: error?.message || String(error),
+          })
+        );
+      });
       break;
     case "call.hangup":
       cancelSilenceTimer(callControlId, "hangup");
@@ -446,6 +582,8 @@ wss.on("connection", (ws, req) => {
     telnyxWs: ws,
     deepgramWs: null,
     finalized: false,
+    flowComplete: false,
+    sttFinalCount: 0,
     context: contextCache.get(callControlId) || null,
   };
   sttSessions.set(callControlId, session);
@@ -457,7 +595,8 @@ wss.on("connection", (ws, req) => {
   session.deepgramWs = dgWs;
 
   dgWs.on("message", (data) => {
-    if (session.finalized) return;
+    if (session.flowComplete) return;
+    session.sttFinalCount += 1;
     let message = null;
     try {
       message = JSON.parse(data.toString());
@@ -470,31 +609,38 @@ wss.on("connection", (ws, req) => {
 
     if (!isFinal || !alt?.transcript) return;
 
-    session.finalized = true;
     cancelSilenceTimer(callControlId, "stt_final");
     const conf =
       typeof alt.confidence === "number"
         ? alt.confidence.toFixed(2)
         : "n/a";
     console.log(
-      `[v5 STT] call_control_id=${callControlId} conf=${conf} text="${alt.transcript}"`
+      `[v5 STT] call_control_id=${callControlId} n=${session.sttFinalCount} conf=${conf} text="${alt.transcript}"`
     );
 
-    handleFaqResponse(callControlId, alt.transcript).catch((error) => {
-      console.error(
-        JSON.stringify({
-          level: "error",
-          message: "FAQ handling failed",
-          call_control_id: callControlId,
-          error: error?.message || String(error),
-        })
-      );
-    });
-
-    try {
-      dgWs.close();
-    } catch (_e) {
-      // ignore
+    const hasFlow = flowState.has(callControlId);
+    if (hasFlow) {
+      handleFlowTranscript(callControlId, alt.transcript).catch((error) => {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "Flow handling failed",
+            call_control_id: callControlId,
+            error: error?.message || String(error),
+          })
+        );
+      });
+    } else {
+      handleFaqResponse(callControlId, alt.transcript).catch((error) => {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "FAQ handling failed",
+            call_control_id: callControlId,
+            error: error?.message || String(error),
+          })
+        );
+      });
     }
   });
 

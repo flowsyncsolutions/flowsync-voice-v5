@@ -14,6 +14,11 @@ const GREETING =
 const SILENCE_REPROMPT_MS = 9000;
 const SILENCE_REPROMPT_TEXT = "How can I help you today?";
 const CALLBACK_OFFER = "Would you like someone to call you back?";
+const ISSUE_SILENCE_FINALIZE_MS = 2000;
+const ISSUE_MAX_LISTEN_MS = 20000;
+const ISSUE_APPEND_DEDUP_WINDOW_MS = 800;
+const ISSUE_SILENCE_FINALIZE_MS = 2000;
+const ISSUE_MAX_LISTEN_MS = 20000;
 const FLOW_CONFIG = {
   flow: "apartment_maintenance_intake_v1",
   steps: [
@@ -200,6 +205,13 @@ function cancelSilenceTimer(callControlId, reason) {
 
 function cleanupStt(callControlId) {
   const session = sttSessions.get(callControlId);
+  const state = flowState.get(callControlId);
+  if (state?.issueFinalizeTimer) {
+    clearTimeout(state.issueFinalizeTimer);
+  }
+  if (state?.issueMaxTimer) {
+    clearTimeout(state.issueMaxTimer);
+  }
   if (!session) return;
 
   if (session.deepgramWs && session.deepgramWs.readyState === WebSocket.OPEN) {
@@ -379,6 +391,76 @@ function computeEmergency(issueText, keywords) {
   return lowerKeywords.some((kw) => kw && norm.includes(kw));
 }
 
+function clearIssueTimers(state) {
+  if (state.issueFinalizeTimer) {
+    clearTimeout(state.issueFinalizeTimer);
+    state.issueFinalizeTimer = null;
+  }
+  if (state.issueMaxTimer) {
+    clearTimeout(state.issueMaxTimer);
+    state.issueMaxTimer = null;
+  }
+}
+
+async function finalizeIssue(callControlId) {
+  const state = flowState.get(callControlId);
+  if (!state || state.step !== "issue_description" || !state.issueListeningActive) return;
+
+  clearIssueTimers(state);
+  state.issueListeningActive = false;
+
+  const issue = normalizeIssueText(state.issueBuffer);
+  const words = issue ? issue.split(/\s+/).filter(Boolean).length : 0;
+  const chars = issue.length;
+
+  console.log(
+    `[apt flow] issue_finalize call_control_id=${callControlId} buffer="${issue}" chars=${chars} words=${words}`
+  );
+
+  state.data.issue_description = issue;
+  console.log(
+    `[apt flow] captured issue_description="${issue}" call_control_id=${callControlId}`
+  );
+
+  const keywords = [
+    "fire",
+    "smoke",
+    "gas",
+    "flood",
+    "leak",
+    "water leak",
+    "no heat",
+    "sparks",
+  ];
+  const normIssue = normalizeText(issue);
+  const hits = keywords.filter((kw) => normIssue.includes(normalizeText(kw)));
+  const isEmergency = hits.length > 0;
+  state.data.is_emergency = isEmergency;
+  console.log(
+    `[apt flow] emergency=${isEmergency} keywords_hit=[${hits.join(",")}] call_control_id=${callControlId}`
+  );
+
+  if (isEmergency) {
+    console.log(
+      `[apt flow] emergency_ack spoken=true call_control_id=${callControlId}`
+    );
+    await sendTelnyxAction(callControlId, "speak", {
+      payload:
+        "I understand this sounds urgent. If you’re in danger, please call 911 now. I’ll log this as an emergency for maintenance.",
+      voice: "female",
+      language: "en-US",
+    });
+  }
+
+  state.step = "permission_to_enter";
+  await sendTelnyxAction(callControlId, "speak", {
+    payload:
+      "Do we have permission to enter your unit if you're not home? Please say yes or no.",
+    voice: "female",
+    language: "en-US",
+  });
+}
+
 function findFaqMatch(transcript, faqs) {
   if (!transcript || !Array.isArray(faqs) || faqs.length === 0) return null;
   const normTranscript = normalizeText(transcript);
@@ -423,6 +505,13 @@ async function initializeFlow(callControlId, toNumber, fromNumber) {
     step: "unit_number",
     data: { to_number: toNumber || "", from_number: fromNumber || "" },
     issueRetryUsed: false,
+    issueBuffer: "",
+    issueLastHeardAt: 0,
+    issueFinalizeTimer: null,
+    issueMaxTimer: null,
+    issueListeningActive: false,
+    lastIssueChunk: "",
+    lastIssueChunkAt: 0,
     ingested: false,
   });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
@@ -445,8 +534,18 @@ async function handleFlowTranscript(callControlId, transcript) {
       `[apt flow] captured unit_number="${unit}" call_control_id=${callControlId}`
     );
     console.log(`[apt flow] prompting issue_description call_control_id=${callControlId}`);
+    clearIssueTimers(state);
+    state.issueListeningActive = true;
+    state.issueBuffer = "";
+    state.lastIssueChunk = "";
+    state.lastIssueChunkAt = 0;
+    state.issueLastHeardAt = Date.now();
+    state.issueMaxTimer = setTimeout(
+      () => finalizeIssue(callControlId),
+      ISSUE_MAX_LISTEN_MS
+    );
     console.log(
-      `[apt flow] issue_capture_settings call_control_id=${callControlId} silence_ms=${SILENCE_REPROMPT_MS} max_ms=default`
+      `[apt flow] issue_listen_start call_control_id=${callControlId} silence_finalize_ms=${ISSUE_SILENCE_FINALIZE_MS} max_listen_ms=${ISSUE_MAX_LISTEN_MS}`
     );
     await sendTelnyxAction(callControlId, "speak", {
       payload: "Please briefly describe the maintenance issue you’re experiencing.",
@@ -457,67 +556,46 @@ async function handleFlowTranscript(callControlId, transcript) {
   }
 
   if (state.step === "issue_description") {
-    const issue = normalizeIssueText(transcript);
-    const attempt = state.issueRetryUsed ? 2 : 1;
-    console.log(
-      `[apt flow] issue_capture_attempt call_control_id=${callControlId} attempt=${attempt} text="${issue}"`
-    );
-
-    if (isTooShortIssue(issue) && !state.issueRetryUsed) {
-      console.log(
-        `[apt flow] issue_too_short call_control_id=${callControlId} text="${issue}" retrying=true`
-      );
-      state.issueRetryUsed = true;
-      await sendTelnyxAction(callControlId, "speak", {
-        payload: "Sorry — I didn’t catch that. What’s the maintenance issue?",
-        voice: "female",
-        language: "en-US",
-      });
+    const issueChunk = normalizeIssueText(transcript);
+    if (!issueChunk) {
       return;
     }
 
-    state.data.issue_description = issue;
-    console.log(
-      `[apt flow] captured issue_description="${issue}" call_control_id=${callControlId}`
-    );
-
-    const keywords = [
-      "fire",
-      "smoke",
-      "gas",
-      "flood",
-      "leak",
-      "water leak",
-      "no heat",
-      "sparks",
-    ];
-    const normIssue = normalizeText(issue);
-    const hits = keywords.filter((kw) => normIssue.includes(normalizeText(kw)));
-    const isEmergency = hits.length > 0;
-    state.data.is_emergency = isEmergency;
-    console.log(
-      `[apt flow] emergency=${isEmergency} keywords_hit=[${hits.join(",")}] call_control_id=${callControlId}`
-    );
-
-    if (isEmergency) {
-      console.log(
-        `[apt flow] emergency_ack spoken=true call_control_id=${callControlId}`
-      );
-      await sendTelnyxAction(callControlId, "speak", {
-        payload:
-          "I understand this sounds urgent. If you’re in danger, please call 911 now. I’ll log this as an emergency for maintenance.",
-        voice: "female",
-        language: "en-US",
-      });
+    const now = Date.now();
+    if (
+      state.lastIssueChunk &&
+      issueChunk === state.lastIssueChunk &&
+      now - state.lastIssueChunkAt < ISSUE_APPEND_DEDUP_WINDOW_MS
+    ) {
+      return;
     }
 
-    state.step = "permission_to_enter";
-    await sendTelnyxAction(callControlId, "speak", {
-      payload:
-        "Do we have permission to enter your unit if you're not home? Please say yes or no.",
-      voice: "female",
-      language: "en-US",
-    });
+    state.lastIssueChunk = issueChunk;
+    state.lastIssueChunkAt = now;
+
+    if (!state.issueBuffer) {
+      state.issueBuffer = issueChunk;
+    } else {
+      state.issueBuffer = `${state.issueBuffer} ${issueChunk}`.trim();
+    }
+
+    console.log(
+      `[apt flow] issue_chunk call_control_id=${callControlId} text="${issueChunk}" buffer_chars=${state.issueBuffer.length}`
+    );
+
+    state.issueLastHeardAt = now;
+    clearIssueTimers(state);
+    state.issueFinalizeTimer = setTimeout(
+      () => finalizeIssue(callControlId),
+      ISSUE_SILENCE_FINALIZE_MS
+    );
+    state.issueMaxTimer = setTimeout(
+      () => finalizeIssue(callControlId),
+      ISSUE_MAX_LISTEN_MS
+    );
+    console.log(
+      `[apt flow] issue_finalize_scheduled call_control_id=${callControlId} in_ms=${ISSUE_SILENCE_FINALIZE_MS}`
+    );
     return;
   }
 
@@ -761,8 +839,9 @@ app.post("/telnyx/call", (req, res) => {
   });
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`FlowSync voice v5 listening on port ${PORT}`);
+const HOST = "0.0.0.0";
+const server = app.listen(PORT, HOST, () => {
+  console.log(`[v5] listening on http://${HOST}:${PORT}`);
 });
 
 const wss = new WebSocketServer({ server, path: "/media" });

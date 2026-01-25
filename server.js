@@ -339,6 +339,12 @@ function normalizeText(text) {
     .trim();
 }
 
+function normalizeIssueText(text) {
+  return (text || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 function countSentences(text) {
   return (text || "")
     .split(/[.!?]+/g)
@@ -349,6 +355,13 @@ function countSentences(text) {
 function isShortAnswer(answer) {
   const text = (answer || "").trim();
   return text.length > 0 && text.length <= 280;
+}
+
+function isTooShortIssue(text) {
+  const clean = normalizeIssueText(text);
+  const wordCount = clean ? clean.split(/\s+/).filter(Boolean).length : 0;
+  const charCount = clean.length;
+  return wordCount < 2 || charCount < 10;
 }
 
 function parseYesNo(text) {
@@ -409,6 +422,7 @@ async function initializeFlow(callControlId, toNumber, fromNumber) {
   flowState.set(callControlId, {
     step: "unit_number",
     data: { to_number: toNumber || "", from_number: fromNumber || "" },
+    issueRetryUsed: false,
     ingested: false,
   });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
@@ -431,6 +445,9 @@ async function handleFlowTranscript(callControlId, transcript) {
       `[apt flow] captured unit_number="${unit}" call_control_id=${callControlId}`
     );
     console.log(`[apt flow] prompting issue_description call_control_id=${callControlId}`);
+    console.log(
+      `[apt flow] issue_capture_settings call_control_id=${callControlId} silence_ms=${SILENCE_REPROMPT_MS} max_ms=default`
+    );
     await sendTelnyxAction(callControlId, "speak", {
       payload: "Please briefly describe the maintenance issue you’re experiencing.",
       voice: "female",
@@ -440,7 +457,25 @@ async function handleFlowTranscript(callControlId, transcript) {
   }
 
   if (state.step === "issue_description") {
-    const issue = (transcript || "").trim();
+    const issue = normalizeIssueText(transcript);
+    const attempt = state.issueRetryUsed ? 2 : 1;
+    console.log(
+      `[apt flow] issue_capture_attempt call_control_id=${callControlId} attempt=${attempt} text="${issue}"`
+    );
+
+    if (isTooShortIssue(issue) && !state.issueRetryUsed) {
+      console.log(
+        `[apt flow] issue_too_short call_control_id=${callControlId} text="${issue}" retrying=true`
+      );
+      state.issueRetryUsed = true;
+      await sendTelnyxAction(callControlId, "speak", {
+        payload: "Sorry — I didn’t catch that. What’s the maintenance issue?",
+        voice: "female",
+        language: "en-US",
+      });
+      return;
+    }
+
     state.data.issue_description = issue;
     console.log(
       `[apt flow] captured issue_description="${issue}" call_control_id=${callControlId}`

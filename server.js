@@ -17,6 +17,10 @@ const CALLBACK_OFFER = "Would you like someone to call you back?";
 const ISSUE_SILENCE_FINALIZE_MS = 2000;
 const ISSUE_MAX_LISTEN_MS = 20000;
 const ISSUE_APPEND_DEDUP_WINDOW_MS = 800;
+const STT_QUALITY_GATE_ENABLED = process.env.V5_STT_QUALITY_GATE === "1";
+const STT_MIN_CONF = Number(process.env.V5_STT_MIN_CONF || "0.85");
+const STT_GARBLE_MAX_RATIO = Number(process.env.V5_STT_GARBLE_MAX_RATIO || "0.5");
+const STT_MIN_WORDS = Number(process.env.V5_STT_MIN_WORDS || "3");
 const FLOW_CONFIG = {
   flow: "apartment_maintenance_intake_v1",
   steps: [
@@ -389,6 +393,21 @@ function computeEmergency(issueText, keywords) {
   return lowerKeywords.some((kw) => kw && norm.includes(kw));
 }
 
+function computeBadTokenRatio(text) {
+  const tokens = normalizeIssueText(text).split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return 1;
+  const fillers = new Set(["um", "uh", "like"]);
+  let bad = 0;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    const prev = i > 0 ? tokens[i - 1] : null;
+    if (t.length <= 2 || fillers.has(t) || (prev && prev === t)) {
+      bad += 1;
+    }
+  }
+  return bad / tokens.length;
+}
+
 function clearIssueTimers(state) {
   if (state.issueFinalizeTimer) {
     clearTimeout(state.issueFinalizeTimer);
@@ -410,6 +429,20 @@ async function finalizeIssue(callControlId) {
   const issue = normalizeIssueText(state.issueBuffer);
   const words = issue ? issue.split(/\s+/).filter(Boolean).length : 0;
   const chars = issue.length;
+  const badRatio = computeBadTokenRatio(issue);
+  const usedLowConf = state.issueLowConfChunks?.length > 0;
+
+  if (
+    STT_QUALITY_GATE_ENABLED &&
+    (words < STT_MIN_WORDS || badRatio > STT_GARBLE_MAX_RATIO)
+  ) {
+    state.issueNeedsCleanup = true;
+    console.log(
+      `[apt flow] issue_garbled call_control_id=${callControlId} words=${words} bad_ratio=${badRatio.toFixed(
+        2
+      )} buffer="${issue}"`
+    );
+  }
 
   console.log(
     `[apt flow] issue_finalize call_control_id=${callControlId} buffer="${issue}" chars=${chars} words=${words}`
@@ -452,11 +485,17 @@ async function finalizeIssue(callControlId) {
 
   state.step = "permission_to_enter";
   await sendTelnyxAction(callControlId, "speak", {
-    payload:
-      "Do we have permission to enter your unit if you're not home? Please say yes or no.",
-    voice: "female",
-    language: "en-US",
-  });
+      payload:
+        "Do we have permission to enter your unit if you're not home? Please say yes or no.",
+      voice: "female",
+      language: "en-US",
+    });
+
+  console.log(
+    `[apt flow] issue_quality_summary call_control_id=${callControlId} final_words=${words} bad_ratio=${badRatio.toFixed(
+      2
+    )} used_low_conf=${usedLowConf}`
+  );
 }
 
 function findFaqMatch(transcript, faqs) {
@@ -510,6 +549,9 @@ async function initializeFlow(callControlId, toNumber, fromNumber) {
     issueListeningActive: false,
     lastIssueChunk: "",
     lastIssueChunkAt: 0,
+    issueLowConfChunks: [],
+    issueBestChunk: null,
+    issueNeedsCleanup: false,
     ingested: false,
   });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
@@ -523,6 +565,10 @@ async function initializeFlow(callControlId, toNumber, fromNumber) {
 async function handleFlowTranscript(callControlId, transcript) {
   const state = flowState.get(callControlId);
   if (!state) return;
+  if (state.step === "issue_description") {
+    await handleIssueChunk(callControlId, { text: transcript, conf: null, alternatives: [] });
+    return;
+  }
 
   if (state.step === "unit_number") {
     const unit = (transcript || "").trim();
@@ -754,6 +800,73 @@ async function handleFaqResponse(callControlId, transcript) {
   }
 }
 
+async function handleIssueChunk(callControlId, { text, conf, alternatives }) {
+  const state = flowState.get(callControlId);
+  if (!state || state.step !== "issue_description") return;
+
+  const chunk = normalizeIssueText(text);
+  if (!chunk) return;
+
+  const now = Date.now();
+
+  if (
+    STT_QUALITY_GATE_ENABLED &&
+    conf !== null &&
+    Number.isFinite(conf) &&
+    conf < STT_MIN_CONF
+  ) {
+    state.issueLowConfChunks = state.issueLowConfChunks || [];
+    state.issueLowConfChunks.push(chunk);
+    if (state.issueLowConfChunks.length > 3) {
+      state.issueLowConfChunks.shift();
+    }
+    if (!state.issueBestChunk || conf > (state.issueBestChunk.conf || 0)) {
+      state.issueBestChunk = { text: chunk, conf };
+    }
+    console.log(
+      `[v5 STT] low_conf_chunk call_control_id=${callControlId} conf=${conf.toFixed(
+        2
+      )} text="${chunk}"`
+    );
+    return;
+  }
+
+  if (
+    state.lastIssueChunk &&
+    chunk === state.lastIssueChunk &&
+    now - state.lastIssueChunkAt < ISSUE_APPEND_DEDUP_WINDOW_MS
+  ) {
+    return;
+  }
+
+  state.lastIssueChunk = chunk;
+  state.lastIssueChunkAt = now;
+
+  if (!state.issueBuffer) {
+    state.issueBuffer = chunk;
+  } else {
+    state.issueBuffer = `${state.issueBuffer} ${chunk}`.trim();
+  }
+
+  console.log(
+    `[apt flow] issue_chunk call_control_id=${callControlId} text="${chunk}" buffer_chars=${state.issueBuffer.length}`
+  );
+
+  state.issueLastHeardAt = now;
+  clearIssueTimers(state);
+  state.issueFinalizeTimer = setTimeout(
+    () => finalizeIssue(callControlId),
+    ISSUE_SILENCE_FINALIZE_MS
+  );
+  state.issueMaxTimer = setTimeout(
+    () => finalizeIssue(callControlId),
+    ISSUE_MAX_LISTEN_MS
+  );
+  console.log(
+    `[apt flow] issue_finalize_scheduled call_control_id=${callControlId} in_ms=${ISSUE_SILENCE_FINALIZE_MS}`
+  );
+}
+
 async function handleTelnyxEvent(eventType, payload, reqHost) {
   const callControlId = payload?.call_control_id;
   const toNumber = resolveToNumber(payload);
@@ -892,7 +1005,8 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    const alt = message?.channel?.alternatives?.[0];
+    const alternatives = message?.channel?.alternatives || [];
+    const alt = alternatives[0];
     const isFinal = Boolean(message?.is_final);
 
     if (!isFinal || !alt?.transcript) return;
@@ -902,12 +1016,36 @@ wss.on("connection", (ws, req) => {
       typeof alt.confidence === "number"
         ? alt.confidence.toFixed(2)
         : "n/a";
+    const confNum =
+      typeof alt.confidence === "number"
+        ? alt.confidence
+        : Number.isFinite(Number(alt.confidence))
+          ? Number(alt.confidence)
+          : null;
+    const confLog = confNum !== null ? confNum.toFixed(2) : "n/a";
+
     console.log(
-      `[v5 STT] call_control_id=${callControlId} n=${session.sttFinalCount} conf=${conf} text="${alt.transcript}"`
+      `[v5 STT] call_control_id=${callControlId} n=${session.sttFinalCount} conf=${confLog} text="${alt.transcript}"`
     );
 
-    const hasFlow = flowState.has(callControlId);
-    if (hasFlow) {
+    const state = flowState.get(callControlId);
+    const hasFlow = Boolean(state);
+    if (hasFlow && state?.step === "issue_description") {
+      handleIssueChunk(callControlId, {
+        text: alt.transcript,
+        conf: confNum,
+        alternatives,
+      }).catch((error) => {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "Issue chunk handling failed",
+            call_control_id: callControlId,
+            error: error?.message || String(error),
+          })
+        );
+      });
+    } else if (hasFlow) {
       handleFlowTranscript(callControlId, alt.transcript).catch((error) => {
         console.error(
           JSON.stringify({

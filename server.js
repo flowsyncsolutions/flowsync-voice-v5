@@ -14,9 +14,11 @@ const GREETING =
 const SILENCE_REPROMPT_MS = 9000;
 const SILENCE_REPROMPT_TEXT = "How can I help you today?";
 const CALLBACK_OFFER = "Would you like someone to call you back?";
-const ISSUE_SILENCE_FINALIZE_MS = 2000;
+const ISSUE_SILENCE_FINALIZE_MS = 3000;
 const ISSUE_MAX_LISTEN_MS = 20000;
 const ISSUE_APPEND_DEDUP_WINDOW_MS = 800;
+const ISSUE_GARBLED_POSTPONE_MS = 2500;
+const ISSUE_GARBLED_MAX_POSTPONES = 2;
 const STT_QUALITY_GATE_ENABLED = process.env.V5_STT_QUALITY_GATE === "1";
 const STT_MIN_CONF = Number(process.env.V5_STT_MIN_CONF || "0.85");
 const STT_GARBLE_MAX_RATIO = Number(process.env.V5_STT_GARBLE_MAX_RATIO || "0.5");
@@ -419,23 +421,44 @@ function clearIssueTimers(state) {
   }
 }
 
-async function finalizeIssue(callControlId) {
+async function finalizeIssue(callControlId, reason = "unknown") {
   const state = flowState.get(callControlId);
   if (!state || state.step !== "issue_description" || !state.issueListeningActive) return;
 
   clearIssueTimers(state);
-  state.issueListeningActive = false;
 
   const issue = normalizeIssueText(state.issueBuffer);
   const words = issue ? issue.split(/\s+/).filter(Boolean).length : 0;
   const chars = issue.length;
   const badRatio = computeBadTokenRatio(issue);
   const usedLowConf = state.issueLowConfChunks?.length > 0;
+  const isGarbled =
+    STT_QUALITY_GATE_ENABLED && (words < STT_MIN_WORDS || badRatio > STT_GARBLE_MAX_RATIO);
+  const now = Date.now();
+  const forced = reason === "max_listen" || (state.issueForceFinalizeAt && now >= state.issueForceFinalizeAt);
 
-  if (
-    STT_QUALITY_GATE_ENABLED &&
-    (words < STT_MIN_WORDS || badRatio > STT_GARBLE_MAX_RATIO)
-  ) {
+  if (isGarbled && !forced && state.issuePostponeCount < ISSUE_GARBLED_MAX_POSTPONES) {
+    state.issuePostponeCount += 1;
+    clearIssueTimers(state);
+    state.issueFinalizeTimer = setTimeout(
+      () => finalizeIssue(callControlId, "postpone"),
+      ISSUE_GARBLED_POSTPONE_MS
+    );
+    console.log(
+      `[apt flow] issue_finalize_postponed call_control_id=${callControlId} postpone_count=${state.issuePostponeCount} in_ms=${ISSUE_GARBLED_POSTPONE_MS} words=${words} bad_ratio=${badRatio.toFixed(
+        2
+      )} buffer="${issue}"`
+    );
+    return;
+  }
+
+  state.issueListeningActive = false;
+
+  console.log(
+    `[apt flow] issue_finalize call_control_id=${callControlId} buffer="${issue}" chars=${chars} words=${words}`
+  );
+
+  if (isGarbled) {
     state.issueNeedsCleanup = true;
     console.log(
       `[apt flow] issue_garbled call_control_id=${callControlId} words=${words} bad_ratio=${badRatio.toFixed(
@@ -443,10 +466,13 @@ async function finalizeIssue(callControlId) {
       )} buffer="${issue}"`
     );
   }
-
-  console.log(
-    `[apt flow] issue_finalize call_control_id=${callControlId} buffer="${issue}" chars=${chars} words=${words}`
-  );
+  if (forced) {
+    console.log(
+      `[apt flow] issue_finalize_forced call_control_id=${callControlId} reason=${reason} words=${words} bad_ratio=${badRatio.toFixed(
+        2
+      )} buffer="${issue}"`
+    );
+  }
 
   state.data.issue_description = issue;
   console.log(
@@ -552,6 +578,8 @@ async function initializeFlow(callControlId, toNumber, fromNumber) {
     issueLowConfChunks: [],
     issueBestChunk: null,
     issueNeedsCleanup: false,
+    issuePostponeCount: 0,
+    issueForceFinalizeAt: 0,
     ingested: false,
   });
   console.log(`[apt flow] started call_control_id=${callControlId}`);
@@ -584,8 +612,10 @@ async function handleFlowTranscript(callControlId, transcript) {
     state.lastIssueChunk = "";
     state.lastIssueChunkAt = 0;
     state.issueLastHeardAt = Date.now();
+    state.issuePostponeCount = 0;
+    state.issueForceFinalizeAt = Date.now() + ISSUE_MAX_LISTEN_MS;
     state.issueMaxTimer = setTimeout(
-      () => finalizeIssue(callControlId),
+      () => finalizeIssue(callControlId, "max_listen"),
       ISSUE_MAX_LISTEN_MS
     );
     console.log(
@@ -630,11 +660,11 @@ async function handleFlowTranscript(callControlId, transcript) {
     state.issueLastHeardAt = now;
     clearIssueTimers(state);
     state.issueFinalizeTimer = setTimeout(
-      () => finalizeIssue(callControlId),
+      () => finalizeIssue(callControlId, "silence"),
       ISSUE_SILENCE_FINALIZE_MS
     );
     state.issueMaxTimer = setTimeout(
-      () => finalizeIssue(callControlId),
+      () => finalizeIssue(callControlId, "max_listen"),
       ISSUE_MAX_LISTEN_MS
     );
     console.log(
@@ -855,11 +885,11 @@ async function handleIssueChunk(callControlId, { text, conf, alternatives }) {
   state.issueLastHeardAt = now;
   clearIssueTimers(state);
   state.issueFinalizeTimer = setTimeout(
-    () => finalizeIssue(callControlId),
+    () => finalizeIssue(callControlId, "silence"),
     ISSUE_SILENCE_FINALIZE_MS
   );
   state.issueMaxTimer = setTimeout(
-    () => finalizeIssue(callControlId),
+    () => finalizeIssue(callControlId, "max_listen"),
     ISSUE_MAX_LISTEN_MS
   );
   console.log(

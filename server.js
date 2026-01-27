@@ -17,8 +17,6 @@ const CALLBACK_OFFER = "Would you like someone to call you back?";
 const ISSUE_SILENCE_FINALIZE_MS = 2000;
 const ISSUE_MAX_LISTEN_MS = 20000;
 const ISSUE_APPEND_DEDUP_WINDOW_MS = 800;
-const ISSUE_SILENCE_FINALIZE_MS = 2000;
-const ISSUE_MAX_LISTEN_MS = 20000;
 const FLOW_CONFIG = {
   flow: "apartment_maintenance_intake_v1",
   steps: [
